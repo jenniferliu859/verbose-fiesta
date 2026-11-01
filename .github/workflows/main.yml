@@ -1,0 +1,140 @@
+Name: FilesYard 10x 200MB Test Upload
+
+on:
+  push:
+    branches: New
+    
+  workflow_dispatch:
+
+jobs:
+  test-upload:
+    runs-on: ubuntu-latest
+    env:
+      FILESYARD_API_KEY: 'fy_jHR0jAMuHii6Y5oIl1Us8ardt5inOcfrcQP4Ih6IfUgKa8fY'
+      FOLDER_PATH: 'downloaded_files'
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Dependencies
+        run: |
+          sudo apt update && sudo apt install jq python3 python3-requests python3-pip -y
+          sudo python3 -m pip install --no-cache-dir --break-system-packages natsort requests
+
+      - name: Create 10x 200MB Test Files
+        run: |
+          mkdir -p "$FOLDER_PATH"
+          echo "Generating 10 separate 200MB test files for FilesYard verification..."
+          for i in {1..10}; do
+            dd if=/dev/urandom of="$FOLDER_PATH/test_upload_file_$i.mp4" bs=1M count=200 status=none
+            echo "Generated file $i: test_upload_file_$i.mp4 (200MB)"
+          done
+
+      - name: Upload to FilesYard (Big-File Multi-part API)
+        run: |
+          python3 -u - << 'EOF'
+          import os
+          import sys
+          import json
+          import requests
+          from concurrent.futures import ThreadPoolExecutor
+          from natsort import natsorted
+
+          API_KEY = os.environ.get('FILESYARD_API_KEY', 'fy_jHR0jAMuHii6Y5oIl1Us8ardt5inOcfrcQP4Ih6IfUgKa8fY').strip()
+          FOLDER_PATH = os.environ.get('FOLDER_PATH', 'downloaded_files')
+          BASE_URL = "https://filesyard.com/api"
+
+          if not API_KEY:
+              print("❌ ERROR: FILESYARD_API_KEY environment variable is missing!", flush=True)
+              sys.exit(1)
+
+          HEADERS = {"X-API-KEY": API_KEY}
+
+          def upload_big_file(file_path):
+              filename = os.path.basename(file_path)
+              file_size = os.path.getsize(file_path)
+              file_size_mb = file_size / (1024 * 1024)
+              
+              print(f"⬆ [START] Uploading: {filename} ({file_size_mb:.2f} MB)", flush=True)
+
+              try:
+                  # Step 1: Start Big File Session
+                  start_url = f"{BASE_URL}/upload/big/start"
+                  payload = {"name": filename, "size": file_size}
+                  resp = requests.post(start_url, headers=HEADERS, data=payload, timeout=30)
+                  res_data = resp.json()
+
+                  if res_data.get("status") != 200:
+                      print(f"❌ Failed to start upload for {filename}: {res_data.get('msg')}", flush=True)
+                      return
+
+                  result = res_data["result"]
+                  upload_id = result["upload_id"]
+                  part_size = result["part_size"]
+                  parts_total = result["parts_total"]
+
+                  # Step 2: Request Part URLs
+                  parts_url = f"{BASE_URL}/upload/big/{upload_id}/parts"
+                  part_numbers_str = ",".join(str(i) for i in range(1, parts_total + 1))
+                  resp_parts = requests.post(parts_url, headers=HEADERS, data={"part_numbers": part_numbers_str}, timeout=30)
+                  parts_data = resp_parts.json()
+
+                  if parts_data.get("status") != 200:
+                      print(f"❌ Failed to get part URLs for {filename}: {parts_data.get('msg')}", flush=True)
+                      return
+
+                  urls = parts_data["result"]["urls"]
+                  etags = []
+
+                  # Step 3: Stream and PUT each part
+                  with open(file_path, "rb") as f:
+                      for part_num in range(1, parts_total + 1):
+                          part_url = urls.get(str(part_num)) or urls.get(part_num)
+                          chunk = f.read(part_size)
+                          
+                          # Upload chunk
+                          put_resp = requests.put(part_url, data=chunk, timeout=600)
+                          etag = put_resp.headers.get("ETag") or put_resp.headers.get("etag")
+                          
+                          if not etag:
+                              print(f"❌ Missing ETag for part {part_num} of {filename}", flush=True)
+                              return
+
+                          etags.append({"part_number": part_num, "etag": etag})
+
+                  # Step 4: Complete Upload
+                  complete_url = f"{BASE_URL}/upload/big/{upload_id}/complete"
+                  complete_resp = requests.post(
+                      complete_url, 
+                      headers={**HEADERS, "Content-Type": "application/json"},
+                      json={"parts": etags},
+                      timeout=30
+                  )
+                  complete_data = complete_resp.json()
+
+                  if complete_data.get("status") == 200:
+                      file_code = complete_data["result"].get("file_code")
+                      file_url = complete_data["result"].get("url")
+                      print(f"✅ Finished uploading {filename} -> Code: {file_code} | Link: {file_url}", flush=True)
+                  else:
+                      print(f"❌ Failed to complete upload for {filename}: {complete_data.get('msg')}", flush=True)
+
+              except Exception as e:
+                  print(f"❌ Exception occurred uploading {filename}: {str(e)}", flush=True)
+
+          if os.path.exists(FOLDER_PATH):
+              upload_queue = []
+              for root, dirs, files in os.walk(FOLDER_PATH):
+                  for filename in files:
+                      if not any(ext in filename for ext in [".!qB", ".part", ".aria2"]):
+                          upload_queue.append(os.path.join(root, filename))
+              
+              upload_queue = natsorted(upload_queue)
+              
+              if upload_queue:
+                  print(f"🚀 Launching parallel upload workers for {len(upload_queue)} files...", flush=True)
+                  # FilesYard limits concurrent uploads (max 2 running at once per account rule),
+                  # using max_workers=2 to prevent rate limiting.
+                  with ThreadPoolExecutor(max_workers=2) as executor:
+                      executor.map(upload_big_file, upload_queue)
+          EOF
