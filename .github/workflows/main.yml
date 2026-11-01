@@ -1,4 +1,4 @@
-Name: FilesYard 10x 200MB Test Upload
+name: FilesYard 10x 200MB Test Upload
 
 on:
   push:
