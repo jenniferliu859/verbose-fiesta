@@ -2,7 +2,7 @@ name: Mocha 10x 200MB Multipart Test Upload
 
 on:
   push:
-    branches: New
+    branches: main
     
   workflow_dispatch:
 
@@ -10,7 +10,7 @@ jobs:
   test-upload:
     runs-on: ubuntu-latest
     env:
-      MOCHA_API_KEY: 'mocha_your_api_key_here'
+      MOCHA_API_KEY: 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY'
       FOLDER_PATH: 'downloaded_files'
 
     steps:
@@ -41,7 +41,7 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor
           from natsort import natsorted
 
-          API_KEY = os.environ.get('MOCHA_API_KEY', '').strip()
+          API_KEY = os.environ.get('MOCHA_API_KEY', 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY').strip()
           FOLDER_PATH = os.environ.get('FOLDER_PATH', 'downloaded_files')
           BASE_URL = "https://api.mocha.my/api"
 
