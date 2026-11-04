@@ -1,4 +1,4 @@
-name: Mocha 10x 200MB Test Upload
+name: Mocha 10x 200MB Multipart Test Upload
 
 on:
   push:
@@ -24,49 +24,134 @@ jobs:
       - name: Create 10x 200MB Test Files
         run: |
           mkdir -p "$FOLDER_PATH"
-          echo "Generating 10 separate 200MB test files for Mocha verification..."
+          echo "Generating 10 separate 200MB test files..."
           for i in {1..10}; do
             dd if=/dev/urandom of="$FOLDER_PATH/test_upload_file_$i.mp4" bs=1M count=200 status=none
             echo "Generated file $i: test_upload_file_$i.mp4 (200MB)"
           done
 
-      - name: Upload to Mocha
+      - name: Upload to Mocha via Multipart API
         run: |
           python3 -u - << 'EOF'
           import os
           import sys
+          import json
+          import hashlib
           import requests
           from concurrent.futures import ThreadPoolExecutor
           from natsort import natsorted
 
           API_KEY = os.environ.get('MOCHA_API_KEY', 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY').strip()
           FOLDER_PATH = os.environ.get('FOLDER_PATH', 'downloaded_files')
-          # Standard Mocha upload/ingest endpoint structure
-          UPLOAD_URL = "https://mocha.my/api/v1/upload"
+          BASE_URL = "https://api.mocha.my/api"
 
           if not API_KEY:
               print("❌ ERROR: MOCHA_API_KEY environment variable is missing!", flush=True)
               sys.exit(1)
 
-          HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+          HEADERS = {
+              "Authorization": f"Bearer {API_KEY}",
+              "Content-Type": "application/json"
+          }
 
-          def upload_single_file(file_path):
+          def calculate_md5(file_path):
+              hash_md5 = hashlib.md5()
+              with open(file_path, "rb") as f:
+                  for chunk in iter(lambda: f.read(8192), b""):
+                      hash_md5.update(chunk)
+              return hash_md5.hexdigest()
+
+          def upload_mocha_multipart(file_path):
               filename = os.path.basename(file_path)
-              file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-              print(f"⬆ [START] Uploading: {filename} ({file_size_mb:.2f} MB)", flush=True)
+              file_size = os.path.getsize(file_path)
+              file_size_mb = file_size / (1024 * 1024)
+              print(f"⬆ [START] Multipart Uploading: {filename} ({file_size_mb:.2f} MB)", flush=True)
 
               try:
-                  with open(file_path, "rb") as f:
-                      files = {"file": (filename, f)}
-                      response = requests.post(UPLOAD_URL, headers=HEADERS, files=files, timeout=3600)
+                  # Compute MD5 checksum
+                  file_md5 = calculate_md5(file_path)
+
+                  # Step 1: Initialize Multipart Upload
+                  init_url = f"{BASE_URL}/files/multipart/init"
+                  init_payload = {
+                      "originalName": filename,
+                      "size": file_size,
+                      "mimeType": "video/mp4",
+                      "path": "/test/",
+                      "directPartSizeBytes": 1073741824  # 1GB chunk threshold
+                  }
                   
-                  if response.status_code in [200, 201]:
-                      print(f"✅ Successfully uploaded {filename}: {response.text}", flush=True)
+                  resp = requests.post(init_url, headers=HEADERS, json=init_payload, timeout=30)
+                  init_data = resp.json()
+
+                  if resp.status_code != 200 or not init_data.get("uploadId"):
+                      # Fallback check if wrapped in standard response object
+                      res_content = init_data.get("result", init_data)
+                      upload_id = res_content.get("uploadId")
+                      if not upload_id:
+                          print(f"❌ Failed to init multipart upload for {filename}: {resp.text}", flush=True)
+                          return
+                      result = res_content
                   else:
-                      print(f"❌ Failed to upload {filename} [Status {response.status_code}]: {response.text}", flush=True)
+                      result = init_data.get("result", init_data)
+
+                  upload_id = result.get("uploadId")
+                  key = result.get("key")
+                  node_id = result.get("nodeId")
+                  
+                  # Extract parts or upload URL list from init response
+                  parts_info = result.get("parts", [{"partNumber": 1, "url": result.get("url") or result.get("uploadUrl")}])
+                  uploaded_parts = []
+
+                  # Step 2: Upload parts via PUT
+                  with open(file_path, "rb") as f:
+                      for part in parts_info:
+                          part_number = part.get("partNumber", 1)
+                          part_url = part.get("url") or part.get("uploadUrl")
+                          
+                          if not part_url:
+                              print(f"❌ Missing upload URL for part {part_number} of {filename}", flush=True)
+                              return
+
+                          chunk_data = f.read()
+                          put_resp = requests.put(part_url, data=chunk_data, timeout=600)
+                          etag = put_resp.headers.get("ETag") or put_resp.headers.get("etag")
+                          
+                          if not etag:
+                              print(f"❌ Missing ETag for part {part_number} of {filename}", flush=True)
+                              return
+
+                          # Ensure ETag is formatted with quotes as requested by the complete API schema
+                          formatted_etag = etag if etag.startswith('"') else f'"{etag}"'
+                          uploaded_parts.append({
+                              "partNumber": part_number,
+                              "etag": formatted_etag
+                          })
+
+                  # Step 3: Complete Multipart Upload
+                  complete_url = f"{BASE_URL}/files/multipart/complete"
+                  complete_payload = {
+                      "uploadId": upload_id,
+                      "key": key,
+                      "nodeId": node_id,
+                      "originalName": filename,
+                      "path": "/test/",
+                      "size": file_size,
+                      "mimeType": "video/mp4",
+                      "md5": file_md5,
+                      "parts": uploaded_parts
+                  }
+
+                  complete_resp = requests.post(complete_url, headers=HEADERS, json=complete_payload, timeout=30)
+                  complete_data = complete_resp.json()
+
+                  if complete_resp.status_code == 200:
+                      print(f"✅ Successfully completed upload for {filename}: {complete_data}", flush=True)
+                  else:
+                      print(f"❌ Failed to complete upload for {filename} [Status {complete_resp.status_code}]: {complete_resp.text}", flush=True)
 
               except Exception as e:
-                  print(f"❌ Exception uploading {filename}: {str(e)}", flush=True)
+                  print(f"❌ Exception during multipart upload of {filename}: {str(e)}", flush=True)
 
           if os.path.exists(FOLDER_PATH):
               upload_queue = []
@@ -78,7 +163,7 @@ jobs:
               upload_queue = natsorted(upload_queue)
               
               if upload_queue:
-                  print(f"🚀 Launching parallel upload workers for {len(upload_queue)} files...", flush=True)
-                  with ThreadPoolExecutor(max_workers=3) as executor:
-                      executor.map(upload_single_file, upload_queue)
+                  print(f"🚀 Launching parallel multipart upload workers for {len(upload_queue)} files...", flush=True)
+                  with ThreadPoolExecutor(max_workers=2) as executor:
+                      executor.map(upload_mocha_multipart, upload_queue)
           EOF
