@@ -2,7 +2,7 @@ name: Mocha 10x 200MB Test Upload
 
 on:
   push:
-    branches: New
+    branches: main
     
   workflow_dispatch:
 
