@@ -2,7 +2,7 @@ name: Mocha 10x 200MB Multipart Test Upload
 
 on:
   push:
-    branches: main
+    branches: New
     
   workflow_dispatch:
 
@@ -10,7 +10,7 @@ jobs:
   test-upload:
     runs-on: ubuntu-latest
     env:
-      MOCHA_API_KEY: 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY'
+      MOCHA_API_KEY: 'mocha_your_api_key_here'
       FOLDER_PATH: 'downloaded_files'
 
     steps:
@@ -41,7 +41,7 @@ jobs:
           from concurrent.futures import ThreadPoolExecutor
           from natsort import natsorted
 
-          API_KEY = os.environ.get('MOCHA_API_KEY', 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY').strip()
+          API_KEY = os.environ.get('MOCHA_API_KEY', '').strip()
           FOLDER_PATH = os.environ.get('FOLDER_PATH', 'downloaded_files')
           BASE_URL = "https://api.mocha.my/api"
 
@@ -82,35 +82,47 @@ jobs:
                   }
                   
                   resp = requests.post(init_url, headers=HEADERS, json=init_payload, timeout=30)
-                  init_data = resp.json()
+                  try:
+                      init_data = resp.json()
+                  except Exception:
+                      print(f"❌ Non-JSON response from init for {filename}: {resp.text}", flush=True)
+                      return
 
-                  if resp.status_code != 200 or not init_data.get("uploadId"):
-                      # Fallback check if wrapped in standard response object
-                      res_content = init_data.get("result", init_data)
-                      upload_id = res_content.get("uploadId")
-                      if not upload_id:
-                          print(f"❌ Failed to init multipart upload for {filename}: {resp.text}", flush=True)
-                          return
-                      result = res_content
-                  else:
-                      result = init_data.get("result", init_data)
+                  if resp.status_code != 200:
+                      print(f"❌ Failed to init multipart upload for {filename} [Status {resp.status_code}]: {resp.text}", flush=True)
+                      return
 
+                  # Extract result payload safely whether wrapped or direct
+                  result = init_data.get("result", init_data)
                   upload_id = result.get("uploadId")
                   key = result.get("key")
                   node_id = result.get("nodeId")
-                  
-                  # Extract parts or upload URL list from init response
-                  parts_info = result.get("parts", [{"partNumber": 1, "url": result.get("url") or result.get("uploadUrl")}])
+
+                  if not upload_id:
+                      print(f"❌ Missing uploadId in response for {filename}. Full response: {init_data}", flush=True)
+                      return
+
+                  # Parse parts and their respective upload URLs dynamically
+                  parts_info = result.get("parts")
+                  if not parts_info:
+                      # Fallback if parts is a single URL field at the root or result level
+                      fallback_url = result.get("url") or result.get("uploadUrl") or result.get("signedUrl")
+                      if fallback_url:
+                          parts_info = [{"partNumber": 1, "url": fallback_url}]
+                      else:
+                          print(f"❌ Could not find parts or upload URL for {filename}. Full response: {init_data}", flush=True)
+                          return
+
                   uploaded_parts = []
 
                   # Step 2: Upload parts via PUT
                   with open(file_path, "rb") as f:
                       for part in parts_info:
                           part_number = part.get("partNumber", 1)
-                          part_url = part.get("url") or part.get("uploadUrl")
+                          part_url = part.get("url") or part.get("uploadUrl") or part.get("signedUrl")
                           
                           if not part_url:
-                              print(f"❌ Missing upload URL for part {part_number} of {filename}", flush=True)
+                              print(f"❌ Missing upload URL for part {part_number} of {filename}. Part data: {part}", flush=True)
                               return
 
                           chunk_data = f.read()
@@ -118,7 +130,7 @@ jobs:
                           etag = put_resp.headers.get("ETag") or put_resp.headers.get("etag")
                           
                           if not etag:
-                              print(f"❌ Missing ETag for part {part_number} of {filename}", flush=True)
+                              print(f"❌ Missing ETag header for part {part_number} of {filename}", flush=True)
                               return
 
                           # Ensure ETag is formatted with quotes as requested by the complete API schema
@@ -143,7 +155,10 @@ jobs:
                   }
 
                   complete_resp = requests.post(complete_url, headers=HEADERS, json=complete_payload, timeout=30)
-                  complete_data = complete_resp.json()
+                  try:
+                      complete_data = complete_resp.json()
+                  except Exception:
+                      complete_data = {"raw": complete_resp.text}
 
                   if complete_resp.status_code == 200:
                       print(f"✅ Successfully completed upload for {filename}: {complete_data}", flush=True)
