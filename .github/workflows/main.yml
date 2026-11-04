@@ -2,183 +2,172 @@ name: Mocha 10x 200MB Multipart Test Upload
 
 on:
   push:
-    branches: main
-    
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   test-upload:
     runs-on: ubuntu-latest
     env:
-      MOCHA_API_KEY: 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY'
+      MOCHA_API_KEY: ${{ secrets.MOCHA_API_KEY }}
       FOLDER_PATH: 'downloaded_files'
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Dependencies
-        run: |
-          sudo apt update && sudo apt install jq python3 python3-requests python3-pip -y
-          sudo python3 -m pip install --no-cache-dir --break-system-packages natsort requests
+        run: python3 -m pip install --no-cache-dir --break-system-packages natsort requests
 
       - name: Create 10x 200MB Test Files
         run: |
           mkdir -p "$FOLDER_PATH"
-          echo "Generating 10 separate 200MB test files..."
           for i in {1..10}; do
             dd if=/dev/urandom of="$FOLDER_PATH/test_upload_file_$i.mp4" bs=1M count=200 status=none
-            echo "Generated file $i: test_upload_file_$i.mp4 (200MB)"
+            echo "Generated file $i"
           done
 
       - name: Upload to Mocha via Multipart API
         run: |
           python3 -u - << 'EOF'
-          import os
-          import sys
-          import json
-          import hashlib
-          import requests
+          import os, sys, hashlib, time, requests
           from concurrent.futures import ThreadPoolExecutor
           from natsort import natsorted
 
           API_KEY = os.environ.get('MOCHA_API_KEY', 'mocha_P_unI7MM0hsvBpSoAq5rO1YUffrsBsPUB3g6pRNUdAY').strip()
           FOLDER_PATH = os.environ.get('FOLDER_PATH', 'downloaded_files')
           BASE_URL = "https://api.mocha.my/api"
+          DIRECT_PART_SIZE = 1073741824  # 1GB
 
           if not API_KEY:
-              print("❌ ERROR: MOCHA_API_KEY environment variable is missing!", flush=True)
+              print("❌ MOCHA_API_KEY is missing (add it as a repo secret)", flush=True)
               sys.exit(1)
 
-          HEADERS = {
-              "Authorization": f"Bearer {API_KEY}",
-              "Content-Type": "application/json"
-          }
+          HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
-          def calculate_md5(file_path):
-              hash_md5 = hashlib.md5()
-              with open(file_path, "rb") as f:
-                  for chunk in iter(lambda: f.read(8192), b""):
-                      hash_md5.update(chunk)
-              return hash_md5.hexdigest()
+          def md5_of(path):
+              h = hashlib.md5()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
 
-          def upload_mocha_multipart(file_path):
-              filename = os.path.basename(file_path)
-              file_size = os.path.getsize(file_path)
-              file_size_mb = file_size / (1024 * 1024)
-              print(f"⬆ [START] Multipart Uploading: {filename} ({file_size_mb:.2f} MB)", flush=True)
+          class PartReader:
+              """File-like wrapper that streams only [offset, offset+length) of a file."""
+              def __init__(self, path, offset, length):
+                  self.f = open(path, "rb")
+                  self.f.seek(offset)
+                  self.remaining = length
+                  self.length = length
+              def __len__(self):
+                  return self.length
+              def read(self, n=-1):
+                  if self.remaining <= 0:
+                      return b""
+                  n = self.remaining if n is None or n < 0 else min(n, self.remaining)
+                  data = self.f.read(n)
+                  self.remaining -= len(data)
+                  return data
+              def close(self):
+                  self.f.close()
 
-              try:
-                  # Compute MD5 checksum
-                  file_md5 = calculate_md5(file_path)
-
-                  # Step 1: Initialize Multipart Upload
-                  init_url = f"{BASE_URL}/files/multipart/init"
-                  init_payload = {
-                      "originalName": filename,
-                      "size": file_size,
-                      "mimeType": "video/mp4",
-                      "path": "/test/",
-                      "directPartSizeBytes": 1073741824  # 1GB chunk threshold
-                  }
-                  
-                  resp = requests.post(init_url, headers=HEADERS, json=init_payload, timeout=30)
+          def put_part(url, path, offset, length, retries=3):
+              last = None
+              for attempt in range(1, retries + 1):
+                  reader = PartReader(path, offset, length)
                   try:
-                      init_data = resp.json()
-                  except Exception:
-                      print(f"❌ Non-JSON response from init for {filename}: {resp.text}", flush=True)
-                      return
-
-                  if resp.status_code != 200:
-                      print(f"❌ Failed to init multipart upload for {filename} [Status {resp.status_code}]: {resp.text}", flush=True)
-                      return
-
-                  # Extract result payload safely whether wrapped or direct
-                  result = init_data.get("result", init_data)
-                  upload_id = result.get("uploadId")
-                  key = result.get("key")
-                  node_id = result.get("nodeId")
-
-                  if not upload_id:
-                      print(f"❌ Missing uploadId in response for {filename}. Full response: {init_data}", flush=True)
-                      return
-
-                  # Parse parts and their respective upload URLs dynamically
-                  parts_info = result.get("parts")
-                  if not parts_info:
-                      # Fallback if parts is a single URL field at the root or result level
-                      fallback_url = result.get("url") or result.get("uploadUrl") or result.get("signedUrl")
-                      if fallback_url:
-                          parts_info = [{"partNumber": 1, "url": fallback_url}]
+                      # No auth/JSON headers: presigned URLs reject them
+                      r = requests.put(url, data=reader, headers={"Content-Length": str(length)}, timeout=900)
+                      if r.status_code in (200, 201, 204):
+                          etag = r.headers.get("ETag") or r.headers.get("etag")
+                          if etag:
+                              return etag
+                          last = "no ETag header in response"
                       else:
-                          print(f"❌ Could not find parts or upload URL for {filename}. Full response: {init_data}", flush=True)
-                          return
+                          last = f"HTTP {r.status_code}: {r.text[:300]}"
+                  except Exception as e:
+                      last = str(e)
+                  finally:
+                      reader.close()
+                  time.sleep(2 * attempt)
+              raise RuntimeError(f"part upload failed: {last}")
 
-                  uploaded_parts = []
+          def upload(path):
+              name = os.path.basename(path)
+              size = os.path.getsize(path)
+              print(f"⬆ START {name} ({size / 1048576:.1f} MB)", flush=True)
+              try:
+                  # 1. init
+                  r = requests.post(f"{BASE_URL}/files/multipart/init", headers=HEADERS, timeout=60, json={
+                      "originalName": name, "size": size, "mimeType": "video/mp4",
+                      "path": "/test/", "directPartSizeBytes": DIRECT_PART_SIZE,
+                  })
+                  if r.status_code not in (200, 201):
+                      raise RuntimeError(f"init failed [{r.status_code}]: {r.text[:500]}")
+                  data = r.json()
+                  res = data.get("result", data)
+                  print(f"ℹ init keys for {name}: {list(res.keys())}", flush=True)
 
-                  # Step 2: Upload parts via PUT
-                  with open(file_path, "rb") as f:
-                      for part in parts_info:
-                          part_number = part.get("partNumber", 1)
-                          part_url = part.get("url") or part.get("uploadUrl") or part.get("signedUrl")
-                          
-                          if not part_url:
-                              print(f"❌ Missing upload URL for part {part_number} of {filename}. Part data: {part}", flush=True)
-                              return
+                  upload_id = res.get("uploadId")
+                  parts = res.get("parts") or []
+                  if not parts:
+                      u = res.get("url") or res.get("uploadUrl") or res.get("signedUrl")
+                      if u:
+                          parts = [{"partNumber": 1, "url": u}]
+                  if not upload_id or not parts:
+                      raise RuntimeError(f"unexpected init response: {data}")
 
-                          chunk_data = f.read()
-                          put_resp = requests.put(part_url, data=chunk_data, timeout=600)
-                          etag = put_resp.headers.get("ETag") or put_resp.headers.get("etag")
-                          
-                          if not etag:
-                              print(f"❌ Missing ETag header for part {part_number} of {filename}", flush=True)
-                              return
+                  parts = sorted(parts, key=lambda p: p.get("partNumber", 1))
 
-                          # Ensure ETag is formatted with quotes as requested by the complete API schema
-                          formatted_etag = etag if etag.startswith('"') else f'"{etag}"'
-                          uploaded_parts.append({
-                              "partNumber": part_number,
-                              "etag": formatted_etag
-                          })
+                  # 2. work out part size (server-provided, else even split)
+                  part_size = res.get("partSize") or res.get("partSizeBytes")
+                  if not part_size:
+                      part_size = -(-size // len(parts))  # ceil division
 
-                  # Step 3: Complete Multipart Upload
-                  complete_url = f"{BASE_URL}/files/multipart/complete"
-                  complete_payload = {
-                      "uploadId": upload_id,
-                      "key": key,
-                      "nodeId": node_id,
-                      "originalName": filename,
-                      "path": "/test/",
-                      "size": file_size,
-                      "mimeType": "video/mp4",
-                      "md5": file_md5,
-                      "parts": uploaded_parts
-                  }
+                  done = []
+                  for p in parts:
+                      num = p.get("partNumber", 1)
+                      url = p.get("url") or p.get("uploadUrl") or p.get("signedUrl")
+                      if not url:
+                          raise RuntimeError(f"part {num} has no URL: {p}")
+                      offset = (num - 1) * part_size
+                      length = min(part_size, size - offset)
+                      if length <= 0:
+                          continue
+                      etag = put_part(url, path, offset, length)
+                      etag = etag if etag.startswith('"') else f'"{etag}"'
+                      done.append({"partNumber": num, "etag": etag})
+                      print(f"  ✓ {name} part {num}/{len(parts)}", flush=True)
 
-                  complete_resp = requests.post(complete_url, headers=HEADERS, json=complete_payload, timeout=30)
-                  try:
-                      complete_data = complete_resp.json()
-                  except Exception:
-                      complete_data = {"raw": complete_resp.text}
-
-                  if complete_resp.status_code == 200:
-                      print(f"✅ Successfully completed upload for {filename}: {complete_data}", flush=True)
-                  else:
-                      print(f"❌ Failed to complete upload for {filename} [Status {complete_resp.status_code}]: {complete_resp.text}", flush=True)
-
+                  # 3. complete
+                  r = requests.post(f"{BASE_URL}/files/multipart/complete", headers=HEADERS, timeout=120, json={
+                      "uploadId": upload_id, "key": res.get("key"), "nodeId": res.get("nodeId"),
+                      "originalName": name, "path": "/test/", "size": size,
+                      "mimeType": "video/mp4", "md5": md5_of(path), "parts": done,
+                  })
+                  if r.status_code not in (200, 201):
+                      raise RuntimeError(f"complete failed [{r.status_code}]: {r.text[:500]}")
+                  print(f"✅ DONE {name}", flush=True)
+                  return True
               except Exception as e:
-                  print(f"❌ Exception during multipart upload of {filename}: {str(e)}", flush=True)
+                  print(f"❌ {name}: {e}", flush=True)
+                  return False
 
-          if os.path.exists(FOLDER_PATH):
-              upload_queue = []
-              for root, dirs, files in os.walk(FOLDER_PATH):
-                  for filename in files:
-                      if not any(ext in filename for ext in [".!qB", ".part", ".aria2"]):
-                          upload_queue.append(os.path.join(root, filename))
-              
-              upload_queue = natsorted(upload_queue)
-              
-              if upload_queue:
-                  print(f"🚀 Launching parallel multipart upload workers for {len(upload_queue)} files...", flush=True)
-                  with ThreadPoolExecutor(max_workers=2) as executor:
-                      executor.map(upload_mocha_multipart, upload_queue)
+          files = []
+          for root, _, names in os.walk(FOLDER_PATH):
+              for n in names:
+                  if not any(x in n for x in (".!qB", ".part", ".aria2")):
+                      files.append(os.path.join(root, n))
+          files = natsorted(files)
+
+          if not files:
+              print("❌ No files found to upload", flush=True)
+              sys.exit(1)
+
+          print(f"🚀 Uploading {len(files)} files...", flush=True)
+          with ThreadPoolExecutor(max_workers=2) as ex:
+              results = list(ex.map(upload, files))
+
+          failed = results.count(False)
+          print(f"Finished: {len(results) - failed} ok, {failed} failed", flush=True)
+          sys.exit(1 if failed else 0)
           EOF
