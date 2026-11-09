@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import RenamePanel from "./RenamePanel.jsx";
+import FolderTreePanel from "./FolderTreePanel.jsx";
 
 const LS = "azgrab_v1";
 const nat = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
@@ -16,6 +18,11 @@ const dateTs = (str, mdy) => {
 };
 const isCopied = (i) => (i.cp || 0) === 3;
 const parseKw = (s) => s.split(/[,\n]+|\s+/).map((x) => x.trim().toLowerCase()).filter(Boolean);
+// rename (nn) + destination folder sent by the userscript
+const carry = (r) => ({
+  ...(typeof r.newName === "string" && r.newName ? { nn: r.newName } : {}),
+  ...(typeof r.folder === "string" && r.folder ? { folder: r.folder, forced: !!r.forced } : {}),
+});
 const normDir = (d) => { const p = d.split("/").map((x) => x.trim()).filter(Boolean); return "/" + p.join("/") + (p.length ? "/" : ""); };
 
 function groupOf(name, by) {
@@ -33,6 +40,7 @@ function groupOf(name, by) {
 const TPL = `# @HEADER@
 # run once: !pip -q install azure-storage-blob
 import os
+import glob
 from azure.storage.blob import BlobServiceClient
 @AUTH@
 
@@ -48,6 +56,31 @@ SPLIT_PART = @PART@
 # Extra filter on blob names (all must match, case-insensitive). [] = no filter
 BLOB_KEYWORDS = @KW@
 
+# Renames and destination folders chosen in the app.
+# RENAMES: {file key: new file name}    FOLDERS: {picked item: destination folder}
+# Missing folders are created. A relative folder goes under LOCAL_DIR; an absolute one
+# (/content/drive/...) is used as is; a folder with * ? [ is matched to the first existing one.
+RENAMES = @RENAMES@
+FOLDERS = @FOLDERS@
+
+def resolve_dir(folder):
+    f = folder.replace(chr(92), "/").rstrip("/")
+    if any(c in f for c in "*?["):
+        hits = sorted(g for g in glob.glob(f) if os.path.isdir(g))
+        if hits:
+            f = hits[0]
+    return f if f.startswith("/") else os.path.join(LOCAL_DIR, f)
+
+def target(name, item):
+    """Local path of a blob (renamed and/or moved into its folder)."""
+    fn = RENAMES.get(name) or os.path.basename(name)
+    folder = FOLDERS.get(item)
+    if folder:
+        return os.path.join(resolve_dir(folder), fn)
+    if name in RENAMES:  # renamed, no folder chosen: stays where the blob path puts it
+        return os.path.join(LOCAL_DIR, os.path.dirname(name), fn)
+    return os.path.join(LOCAL_DIR, name)
+
 def ok(name):
     n = name.lower()
     return all(k.lower() in n for k in BLOB_KEYWORDS)
@@ -57,16 +90,16 @@ def main():
     cc = svc.get_container_client(CONTAINER)
     os.makedirs(LOCAL_DIR, exist_ok=True)
 
-    blobs = []
+    blobs = []  # (blob, picked item)
     for it in ITEMS:
         prefix = it.rstrip("/") + "/"
         sub = list(cc.list_blobs(name_starts_with=prefix))
         if sub:                       # it's a folder: take everything under it
-            blobs.extend(b for b in sub if ok(b.name))
+            blobs.extend((b, it) for b in sub if ok(b.name))
         elif ok(it):                  # it's a single blob
-            blobs.append(cc.get_blob_client(it).get_blob_properties())
+            blobs.append((cc.get_blob_client(it).get_blob_properties(), it))
 
-    blobs.sort(key=lambda b: b.name)
+    blobs.sort(key=lambda t: t[0].name)
     total = len(blobs)
     if SPLIT_PART:
         mid = (total + 1) // 2
@@ -74,13 +107,13 @@ def main():
     print(f"{len(ITEMS)} items -> {total} blobs total | "
           f"downloading {len(blobs)} (SPLIT_PART={SPLIT_PART})")
 
-    for b in blobs:
-        lp = os.path.join(LOCAL_DIR, b.name)
-        os.makedirs(os.path.dirname(lp), exist_ok=True)
+    for b, it in blobs:
+        lp = target(b.name, it)
+        os.makedirs(os.path.dirname(lp), exist_ok=True)  # create the folder if it is missing
         if os.path.exists(lp) and os.path.getsize(lp) == b.size:
-            print("Skip (exists):", b.name)
+            print("Skip (exists):", lp)
             continue
-        print("Downloading:", b.name)
+        print("Downloading:", b.name, "->", lp)
         with open(lp, "wb") as f:
             cc.get_blob_client(b.name).download_blob().readinto(f)  # streams, no full read into RAM
     print("Download complete.")
@@ -196,8 +229,8 @@ export default function App() {
           if (!r || typeof r.name !== "string" || typeof r.dir !== "string") return;
           const dir = normDir(r.dir), k = dir + "\0" + r.name, old = idx.get(k);
           const date = typeof r.date === "string" ? r.date : "";
-          if (old) { if (r.checked) old.checked = true; if (typeof r.isDir === "boolean") old.isDir = r.isDir; if (date) old.date = date; return; }
-          const it = { name: r.name, dir, isDir: !!r.isDir, checked: !!r.checked, idx: seq++, date };
+          if (old) { if (r.checked) old.checked = true; if (typeof r.isDir === "boolean") old.isDir = r.isDir; if (date) old.date = date; Object.assign(old, carry(r)); return; }
+          const it = { name: r.name, dir, isDir: !!r.isDir, checked: !!r.checked, idx: seq++, date, ...carry(r) };
           idx.set(k, it); next.push(it);
         });
         const c = (list.find((r) => r && typeof r.container === "string" && r.container.trim()) || {}).container;
@@ -293,8 +326,23 @@ export default function App() {
   const ticked = visible.filter((i) => i.checked);
   const base = (ticked.length ? ticked : visible.filter((i) => !isCopied(i))).slice().sort(itemCmp);
   const pre = s.prefix.replace(/^\/+|\/+$/g, "");
-  const keys = base.map((i) => { const p = (i.dir + i.name).replace(/^\/+/, ""); return pre ? pre + "/" + p : p; });
+  const keyOf = (i) => { const p = (i.dir + i.name).replace(/^\/+/, ""); return pre ? pre + "/" + p : p; };
+  const keys = base.map(keyOf);
+  const renameMap = {}, folderMap = {};
+  base.forEach((i) => { const k = keyOf(i); if (i.nn && !i.isDir) renameMap[k] = i.nn; if (i.folder) folderMap[k] = i.folder; });
   const multiDir = new Set(s.items.map((i) => i.dir)).size > 1;
+
+  const files = base.filter((i) => !i.isDir);
+  const renameLinks = files.map((i) => ({ url: keyOf(i), name: i.nn || i.name }));
+  const treeLinks = base.map((i) => ({ url: keyOf(i), title: i.nn || i.name, names: [i.name] }));
+  const treePlan = useMemo(
+    () => ({ folders: [], folder: "", batches: [], assignments: Object.fromEntries(s.items.filter((i) => i.folder).map((i) => [keyOf(i), { folder: i.folder, forced: i.forced }])) }),
+    [s.items, s.prefix] // eslint-disable-line
+  );
+  const applyRenames = (map) => setItems((a) => a.map((x) => { const n = map[keyOf(x)]; return n ? { ...x, nn: n === x.name ? undefined : n } : x; }));
+  const resetRenames = (urls) => { const u = new Set(urls); setItems((a) => a.map((x) => (u.has(keyOf(x)) ? { ...x, nn: undefined } : x))); };
+  const applyPlan = (p) => setItems((a) => a.map((x) => { const e = p.assignments[keyOf(x)]; return e ? { ...x, folder: e.folder || undefined, forced: e.folder && e.forced ? true : undefined } : x; }));
+
 
   function buildPython(part) {
     const header = part
@@ -307,10 +355,12 @@ export default function App() {
       .replace("@PART@", () => String(part || 0))
       .replace("@CONTAINER@", () => JSON.stringify(s.container.trim() || "uploads"))
       .replace("@ITEMS@", () => JSON.stringify(keys, null, 4))
+      .replace("@RENAMES@", () => JSON.stringify(renameMap, null, 4))
+      .replace("@FOLDERS@", () => JSON.stringify(folderMap, null, 4))
       .replace("@KW@", () => JSON.stringify(parseKw(s.fileKw)));
   }
   function buildList() {
-    return ["# " + base.length + " item(s)", ...base.map((i) => "# - " + i.name), ...base.map((i) => i.name + " | " + i.dir)].join("\n");
+    return ["# " + base.length + " item(s)", ...base.map((i) => "# - " + i.name), ...base.map((i) => i.name + " | " + i.dir + (i.nn || i.folder ? " | " + (i.nn || "") + " | " + (i.folder || "") : ""))].join("\n");
   }
 
   const toggle = (it, v) => setItems((a) => a.map((x) => (x === it ? { ...x, checked: v } : x)));
@@ -334,7 +384,7 @@ export default function App() {
   const renderItem = (i, sub) => (
     <label className={(sub ? "sub" : "") + (isCopied(i) ? " done" : "")} key={i.dir + i.name}>
       <input type="checkbox" checked={i.checked} onChange={(e) => toggle(i, e.target.checked)} />
-      <span>{isCopied(i) ? "✔ " : i.cp ? "◐ " : ""}{i.isDir ? "📁 " : "🎞 "}{i.name}{multiDir && <small style={{ display: "block", opacity: 0.65 }}>{i.dir}</small>}{isDateSort && i.date && <small style={{ display: "block", opacity: 0.65 }}>{i.date}</small>}</span>
+      <span>{isCopied(i) ? "✔ " : i.cp ? "◐ " : ""}{i.isDir ? "📁 " : "🎞 "}{i.name}{i.nn && <small style={{ display: "block", fontWeight: 700 }}>→ {i.nn}</small>}{i.folder && <small style={{ display: "block", opacity: 0.8 }}>📂 {i.folder}</small>}{multiDir && <small style={{ display: "block", opacity: 0.65 }}>{i.dir}</small>}{isDateSort && i.date && <small style={{ display: "block", opacity: 0.65 }}>{i.date}</small>}</span>
     </label>
   );
 
@@ -431,6 +481,9 @@ export default function App() {
           <button onClick={() => setItems((a) => a.map((x) => (visible.includes(x) && !isCopied(x) ? { ...x, checked: true } : x)))}>Select shown</button>
           <button onClick={() => setItems((a) => a.map((x) => ({ ...x, checked: false })))}>Clear selection</button>
         </div>
+        <RenamePanel links={renameLinks} renamedCount={files.filter((i) => i.nn).length} notify={setNotice} storeKey="azgrab_rename" onApply={applyRenames} onReset={resetRenames} />
+        <FolderTreePanel links={treeLinks} plan={treePlan} onChange={applyPlan} notify={setNotice} storeKey="azgrab_tree" />
+
         <div className="row">
           {s.colab || !s.split ? (
             <button className="go" onClick={() => copy(0, "all")}>{copied === "all" ? "✔ Copied!" : s.colab ? "Copy list" : "Copy script"}</button>
