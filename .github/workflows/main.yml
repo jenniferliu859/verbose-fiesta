@@ -54,6 +54,9 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
+          # Inject the token into the remote URL so git push authenticates correctly
+          git remote set-url origin https://x-access-token:${{ secrets.TOKEN }}@github.com/${{ github.repository }}.git
+          
           git add .
           
           if git diff --staged --quiet; then
