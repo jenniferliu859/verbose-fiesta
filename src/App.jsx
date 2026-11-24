@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import RenamePanel from "./RenamePanel.jsx";
 import FolderTreePanel from "./FolderTreePanel.jsx";
+import CloudPanel from "./CloudPanel.jsx";
 
 const LS = "azgrab_v1";
 const nat = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
@@ -395,6 +396,8 @@ export default function App() {
         <Cloud /><Sparkle /><Heart />
         <div id="fgb-head">Grab builder (Azure)</div>
         {notice && <div id="fgb-notice">✔ {notice}</div>}
+
+        <CloudPanel appId="azure-web" keys={["azgrab_v1", "azgrab_rename", "azgrab_tree"]} rev={s} />
 
         <details className="box">
           <summary>＋ Add items (paste)</summary>
